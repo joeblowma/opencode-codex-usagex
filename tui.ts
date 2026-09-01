@@ -65,6 +65,12 @@ const formatNumber = (value: number | null | undefined): string => {
   return typeof value === "number" && Number.isFinite(value) ? value.toLocaleString() : "-";
 };
 
+const remainingText = (value: number | null | undefined): string => {
+  return typeof value === "number" && Number.isFinite(value)
+    ? `${Math.max(0, Math.min(100, 100 - value))}% left`
+    : "-";
+};
+
 const panelText = (solid: SolidRuntime, text: string): unknown => {
   const node = solid.createElement("text");
   solid.insert(node, text);
@@ -92,11 +98,11 @@ const buildSidebarPanel = (
   if (used && typeof used === "object" && reset && typeof reset === "object") {
     solid.insert(
       box,
-      panelText(solid, `5h: ${formatNumber(used.primary)}% · ${reset.primary ?? "-"}`),
+      panelText(solid, `5h: ${remainingText(used.primary)} · ${reset.primary ?? "-"}`),
     );
     solid.insert(
       box,
-      panelText(solid, `7d: ${formatNumber(used.secondary)}% · ${reset.secondary ?? "-"}`),
+      panelText(solid, `7d: ${remainingText(used.secondary)} · ${reset.secondary ?? "-"}`),
     );
   } else {
     solid.insert(box, panelText(solid, snapshot?.error ? "Quota: error" : "Quota: loading…"));
