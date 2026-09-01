@@ -33,7 +33,7 @@ type TuiApi = {
   slots?: {
     register: (registration: {
       order?: number;
-      slots: { sidebar_footer: (props: { session_id: string }) => unknown };
+      slots: { sidebar_content: (props: { session_id: string }) => unknown };
     }) => () => void;
   };
   state?: {
@@ -155,7 +155,7 @@ export const CodexQuotaTuiPlugin = async (api: TuiApi): Promise<void> => {
     unregisterSidebar = api.slots.register({
       order: 900,
       slots: {
-        sidebar_footer: ({ session_id }) =>
+        sidebar_content: ({ session_id }) =>
           buildSidebarPanel(solid, api, latestSnapshot, session_id),
       },
     });
