@@ -30,6 +30,86 @@ type TuiApi = {
   lifecycle: {
     onDispose: (dispose: () => void) => () => void;
   };
+  slots?: {
+    register: (registration: {
+      order?: number;
+      slots: { sidebar_footer: (props: { session_id: string }) => unknown };
+    }) => () => void;
+  };
+  state?: {
+    session: {
+      get: (sessionId: string) =>
+        | {
+            tokens?: {
+              input?: number;
+              output?: number;
+              reasoning?: number;
+              cache?: { read?: number; write?: number };
+            };
+          }
+        | undefined;
+    };
+  };
+  renderer?: { requestRender: () => void };
+};
+
+type SolidRuntime = {
+  createElement: (kind: string) => unknown;
+  setProp: (element: unknown, name: string, value: unknown) => void;
+  insert: (parent: unknown, child: unknown) => void;
+};
+
+type QuotaSnapshot = Awaited<ReturnType<typeof probeQuota>>;
+
+const formatNumber = (value: number | null | undefined): string => {
+  return typeof value === "number" && Number.isFinite(value) ? value.toLocaleString() : "-";
+};
+
+const panelText = (solid: SolidRuntime, text: string): unknown => {
+  const node = solid.createElement("text");
+  solid.insert(node, text);
+  return node;
+};
+
+const buildSidebarPanel = (
+  solid: SolidRuntime,
+  api: TuiApi,
+  snapshot: QuotaSnapshot | undefined,
+  sessionId: string,
+): unknown => {
+  const box = solid.createElement("box");
+  solid.setProp(box, "flexDirection", "column");
+  solid.setProp(box, "paddingLeft", 1);
+  solid.setProp(box, "paddingRight", 1);
+
+  const title = solid.createElement("text");
+  solid.setProp(title, "fg", "cyan");
+  solid.insert(title, "Codex quota");
+  solid.insert(box, title);
+
+  const used = snapshot?.used;
+  const reset = snapshot?.reset;
+  if (used && typeof used === "object" && reset && typeof reset === "object") {
+    solid.insert(
+      box,
+      panelText(solid, `5h: ${formatNumber(used.primary)}% · ${reset.primary ?? "-"}`),
+    );
+    solid.insert(
+      box,
+      panelText(solid, `7d: ${formatNumber(used.secondary)}% · ${reset.secondary ?? "-"}`),
+    );
+  } else {
+    solid.insert(box, panelText(solid, snapshot?.error ? "Quota: error" : "Quota: loading…"));
+  }
+
+  const tokens = api.state?.session.get(sessionId)?.tokens;
+  if (tokens) {
+    solid.insert(box, panelText(solid, `input: ${formatNumber(tokens.input)}`));
+    solid.insert(box, panelText(solid, `output: ${formatNumber(tokens.output)}`));
+    solid.insert(box, panelText(solid, `cache: ${formatNumber(tokens.cache?.read)}`));
+  }
+
+  return box;
 };
 
 const TUI_DEBUG_ENV = "OPENCODE_CODEX_USAGE_TUI_DEBUG";
@@ -49,6 +129,33 @@ const debugLog = (message: string, extra: Record<string, unknown> = {}): void =>
 export const CodexQuotaTuiPlugin = async (api: TuiApi): Promise<void> => {
   const toastDurationMs = resolveToastDurationMs();
   let running = false;
+  let latestSnapshot: QuotaSnapshot | undefined;
+  let pollTimer: ReturnType<typeof setInterval> | undefined;
+  let unregisterSidebar: (() => void) | undefined;
+
+  const refreshSidebar = async (): Promise<void> => {
+    if (running) return;
+    running = true;
+    try {
+      latestSnapshot = await probeQuota();
+      api.renderer?.requestRender();
+    } finally {
+      running = false;
+    }
+  };
+
+  const solid = (await import("@opentui/solid").catch(() => undefined)) as SolidRuntime | undefined;
+  if (solid && api.slots) {
+    unregisterSidebar = api.slots.register({
+      order: 900,
+      slots: {
+        sidebar_footer: ({ session_id }) =>
+          buildSidebarPanel(solid, api, latestSnapshot, session_id),
+      },
+    });
+    pollTimer = setInterval(() => void refreshSidebar(), 600_000);
+    void refreshSidebar();
+  }
 
   debugLog("tui plugin loaded", {
     hasCommandRegister: typeof api.command?.register,
@@ -124,6 +231,8 @@ export const CodexQuotaTuiPlugin = async (api: TuiApi): Promise<void> => {
 
   api.lifecycle.onDispose(() => {
     debugLog("tui plugin disposed");
+    if (pollTimer) clearInterval(pollTimer);
+    unregisterSidebar?.();
     dispose();
   });
 };

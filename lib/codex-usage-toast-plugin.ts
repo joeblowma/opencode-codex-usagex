@@ -212,23 +212,23 @@ export const isCodexUsageCommand = (name: string | undefined): boolean => {
   return name === "/codex-usage" || name === "codex-usage";
 };
 
-export const isSessionCreatedEvent = (eventType: string): boolean => {
+export const isSessionCreatedEvent = (eventType: unknown): boolean => {
   return eventType === "session.created";
 };
 
-export const isSessionActivityEvent = (eventType: string): boolean => {
+export const isSessionActivityEvent = (eventType: unknown): boolean => {
   return eventType === "session.updated" || eventType === "session.status";
 };
 
-export const isSessionDeletedEvent = (eventType: string): boolean => {
+export const isSessionDeletedEvent = (eventType: unknown): boolean => {
   return eventType === "session.deleted";
 };
 
-export const isFileWatcherEvent = (eventType: string): boolean => {
-  return eventType.startsWith("file.watcher.");
+export const isFileWatcherEvent = (eventType: unknown): boolean => {
+  return typeof eventType === "string" && eventType.startsWith("file.watcher.");
 };
 
-export const isCommandExecutedEvent = (eventType: string): boolean => {
+export const isCommandExecutedEvent = (eventType: unknown): boolean => {
   return eventType === "command.executed";
 };
 
