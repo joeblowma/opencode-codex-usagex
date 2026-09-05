@@ -2,7 +2,11 @@ import { appendFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { probeQuota } from "./lib/codex-usage-probe.js";
-import { resolveToastDurationMs, toastBodyFromParsed } from "./lib/codex-usage-toast-plugin.js";
+import {
+  DEFAULT_POLL_MS,
+  resolveToastDurationMs,
+  toastBodyFromParsed,
+} from "./lib/codex-usage-toast-plugin.js";
 
 type TuiToast = {
   title?: string;
@@ -34,7 +38,7 @@ type TuiApi = {
     register: (registration: {
       order?: number;
       slots: { sidebar_content: (props: { session_id: string }) => unknown };
-    }) => () => void;
+    }) => string;
   };
   state?: {
     session: {
@@ -81,6 +85,7 @@ const buildSidebarPanel = (
   solid: SolidRuntime,
   api: TuiApi,
   snapshot: QuotaSnapshot | undefined,
+  lastGood: QuotaSnapshot | undefined,
   sessionId: string,
 ): unknown => {
   const box = solid.createElement("box");
@@ -93,8 +98,10 @@ const buildSidebarPanel = (
   solid.insert(title, "Codex quota");
   solid.insert(box, title);
 
-  const used = snapshot?.used;
-  const reset = snapshot?.reset;
+  const view = snapshot && !snapshot.error ? snapshot : lastGood;
+  const stale = snapshot?.error !== undefined && snapshot.error !== "" && view === lastGood;
+  const used = view?.used;
+  const reset = view?.reset;
   if (used && typeof used === "object" && reset && typeof reset === "object") {
     solid.insert(
       box,
@@ -104,6 +111,9 @@ const buildSidebarPanel = (
       box,
       panelText(solid, `7d: ${remainingText(used.secondary)} · ${reset.secondary ?? "-"}`),
     );
+    if (stale) {
+      solid.insert(box, panelText(solid, "stale · last known"));
+    }
   } else {
     solid.insert(box, panelText(solid, snapshot?.error ? "Quota: error" : "Quota: loading…"));
   }
@@ -132,34 +142,46 @@ const debugLog = (message: string, extra: Record<string, unknown> = {}): void =>
   void appendFile(debugLogPath, `${line}\n`, "utf8").catch(() => undefined);
 };
 
-export const CodexQuotaTuiPlugin = async (api: TuiApi): Promise<void> => {
+export const CodexQuotaTuiPlugin = async (
+  api: TuiApi,
+  injected?: { solid?: SolidRuntime },
+): Promise<void> => {
   const toastDurationMs = resolveToastDurationMs();
   let running = false;
   let latestSnapshot: QuotaSnapshot | undefined;
+  let lastGoodSnapshot: QuotaSnapshot | undefined;
   let pollTimer: ReturnType<typeof setInterval> | undefined;
-  let unregisterSidebar: (() => void) | undefined;
+  // NOTE: api.slots.register() returns a host-assigned slot id (string), not an
+  // unregister function. Slot registrations are tracked and disposed by the TUI
+  // runtime automatically, so there is nothing to call here on cleanup.
+  let slotId: string | undefined;
 
   const refreshSidebar = async (): Promise<void> => {
     if (running) return;
     running = true;
     try {
       latestSnapshot = await probeQuota();
+      if (!latestSnapshot.error) lastGoodSnapshot = latestSnapshot;
       api.renderer?.requestRender();
     } finally {
       running = false;
     }
   };
 
-  const solid = (await import("@opentui/solid").catch(() => undefined)) as SolidRuntime | undefined;
+  // `injected.solid` is a test seam: @opentui/solid needs Bun FFI and cannot load
+  // under plain node --test, so tests inject a fake runtime instead.
+  const solid =
+    injected?.solid ??
+    ((await import("@opentui/solid").catch(() => undefined)) as SolidRuntime | undefined);
   if (solid && api.slots) {
-    unregisterSidebar = api.slots.register({
+    slotId = api.slots.register({
       order: 900,
       slots: {
         sidebar_content: ({ session_id }) =>
-          buildSidebarPanel(solid, api, latestSnapshot, session_id),
+          buildSidebarPanel(solid, api, latestSnapshot, lastGoodSnapshot, session_id),
       },
     });
-    pollTimer = setInterval(() => void refreshSidebar(), 600_000);
+    pollTimer = setInterval(() => void refreshSidebar(), DEFAULT_POLL_MS);
     void refreshSidebar();
   }
 
@@ -236,9 +258,8 @@ export const CodexQuotaTuiPlugin = async (api: TuiApi): Promise<void> => {
   debugLog("command registered");
 
   api.lifecycle.onDispose(() => {
-    debugLog("tui plugin disposed");
+    debugLog("tui plugin disposed", { slotId });
     if (pollTimer) clearInterval(pollTimer);
-    unregisterSidebar?.();
     dispose();
   });
 };
