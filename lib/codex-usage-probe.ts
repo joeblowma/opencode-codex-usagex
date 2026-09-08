@@ -1,13 +1,7 @@
 import { readFile } from "node:fs/promises";
 import { z } from "zod";
 import { resolveAuthPath } from "./auth-path.js";
-import {
-  durationText,
-  extractCompletedUsageFromSse,
-  healthLabel,
-  statusState,
-  val,
-} from "./quota-format.js";
+import { durationText, healthLabel, statusState } from "./quota-format.js";
 
 type AuthFile = {
   openai?: {
@@ -23,14 +17,6 @@ const AuthSchema = z.object({
       accountId: z.string().optional(),
     })
     .optional(),
-});
-
-const CodexModelsResponseSchema = z.object({
-  models: z.array(z.unknown()),
-});
-
-const CodexModelSchema = z.object({
-  slug: z.string(),
 });
 
 const ProbeErrorSchema = z.object({
@@ -58,11 +44,10 @@ const errorMessage = (error: unknown): string => {
   return error instanceof Error ? error.message : String(error);
 };
 
-const CODEX_URL = "https://chatgpt.com/backend-api/codex/responses";
-const CODEX_MODELS_URL = "https://chatgpt.com/backend-api/codex/models?client_version=1.0.0";
+// Dedicated quota endpoint: returns rate-limit windows without spending model quota.
+const CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage";
 const REQUEST_TIMEOUT_MS = 15_000;
 const RETRY_COUNT_ENV = "OPENCODE_CODEX_QUOTA_RETRY_COUNT";
-const MODEL_ENV = "OPENCODE_CODEX_QUOTA_MODEL";
 const MAX_RETRY_COUNT = 2;
 
 type WindowPair<T> = {
@@ -75,6 +60,7 @@ export type ProbeSnapshot = {
   statusCode?: number | string;
   used?: WindowPair<number | null> | string;
   reset?: WindowPair<string | null> | string;
+  resetAtMs?: WindowPair<number | null>;
   windowMinutes?: WindowPair<number | null> | string;
   plan?: string;
   profile?: string;
@@ -85,7 +71,6 @@ export type ProbeSnapshot = {
 export type ProbeQuotaOptions = {
   retryCount?: number;
   timeoutMs?: number;
-  model?: string;
   fetchImpl?: typeof fetch;
   env?: NodeJS.ProcessEnv;
   credentials?: {
@@ -105,11 +90,6 @@ const toProbeError = (
   };
   if (statusCode !== undefined) snapshot.statusCode = statusCode;
   return snapshot;
-};
-
-const parseOptionalInt = (raw: string): number | null => {
-  const parsed = Number.parseInt(raw, 10);
-  return Number.isFinite(parsed) ? parsed : null;
 };
 
 export const normalizeUsagePercent = (raw: string): number | null => {
@@ -141,8 +121,19 @@ export const normalizeResetValue = (raw: string, nowMs = Date.now()): string | n
   return value === "-" ? null : value;
 };
 
-const parseOptionalDuration = (secondsRaw: string, nowMs: number): string | null => {
-  return normalizeResetValue(secondsRaw, nowMs);
+// Absolute reset moment as epoch ms, so renderers can compute a live countdown
+// at display time instead of freezing the relative text from probe time.
+// Mirrors the unit detection in normalizeResetValue: plain numbers are seconds
+// remaining, large numbers are second/ms epoch timestamps.
+export const normalizeResetAtMs = (raw: string, nowMs = Date.now()): number | null => {
+  const trimmed = raw.trim();
+  if (trimmed === "") return null;
+
+  const parsed = Number.parseFloat(trimmed);
+  if (!Number.isFinite(parsed) || parsed < 0) return null;
+  if (parsed > 1_000_000_000_000) return Math.floor(parsed);
+  if (parsed > 1_000_000_000) return Math.floor(parsed * 1000);
+  return Math.floor(nowMs + parsed * 1000);
 };
 
 const parseRetryCount = (raw: string | undefined, fallback = 1): number => {
@@ -156,96 +147,6 @@ export const resolveProbeRetryCount = (
   fallback = 1,
 ): number => {
   return parseRetryCount(env[RETRY_COUNT_ENV], fallback);
-};
-
-export const resolveProbeModel = (env: NodeJS.ProcessEnv = process.env, fallback = ""): string => {
-  const configured = env[MODEL_ENV]?.trim();
-  return configured && configured !== "" ? configured : fallback;
-};
-
-const shouldCanonicalizeConfiguredModel = (model: string): boolean => {
-  return /-(fast|low|medium|high|xhigh|minimal)$/.test(model);
-};
-
-const resolveSupportedProbeModels = async (
-  access: string,
-  accountId: string,
-  fetchImpl: typeof fetch,
-): Promise<string[] | ProbeSnapshot> => {
-  let response: Response;
-  let responseText = "";
-
-  try {
-    response = await fetchImpl(CODEX_MODELS_URL, {
-      headers: {
-        Authorization: `Bearer ${access}`,
-        accept: "application/json",
-        "openai-beta": "responses=experimental",
-        originator: "codex_cli_rs",
-        "chatgpt-account-id": accountId,
-      },
-    });
-
-    responseText = await response.text();
-  } catch (error) {
-    const detail = errorMessage(error);
-    return toProbeError("error", detail.slice(0, 120), "network");
-  }
-
-  if (!response.ok) {
-    const detail = parseProbeErrorDetail(responseText).slice(0, 240);
-    return toProbeError("error", detail, response.status);
-  }
-
-  try {
-    const parsed = CodexModelsResponseSchema.safeParse(JSON.parse(responseText));
-    if (!parsed.success) {
-      return toProbeError("error", "invalid Codex models response", "model");
-    }
-
-    const models: string[] = [];
-    for (const entry of parsed.data.models) {
-      const modelEntry = CodexModelSchema.safeParse(entry);
-      if (!modelEntry.success) continue;
-      const model = modelEntry.data.slug.trim();
-      if (model !== "") models.push(model);
-    }
-    if (models.length > 0) return models;
-  } catch {
-    return toProbeError("error", "invalid Codex models response", "model");
-  }
-
-  return toProbeError("error", "no supported Codex models returned for this account", "model");
-};
-
-const resolveDefaultProbeModel = async (
-  access: string,
-  accountId: string,
-  fetchImpl: typeof fetch,
-): Promise<string | ProbeSnapshot> => {
-  const supportedModels = await resolveSupportedProbeModels(access, accountId, fetchImpl);
-  if ("status" in supportedModels) return supportedModels;
-  return (
-    supportedModels[0] ??
-    toProbeError("error", "no supported Codex models returned for this account", "model")
-  );
-};
-
-const canonicalizeConfiguredProbeModel = async (
-  model: string,
-  access: string,
-  accountId: string,
-  fetchImpl: typeof fetch,
-): Promise<string> => {
-  if (!shouldCanonicalizeConfiguredModel(model)) return model;
-
-  const supportedModels = await resolveSupportedProbeModels(access, accountId, fetchImpl);
-  if ("status" in supportedModels) return model;
-
-  const sorted = [...supportedModels].sort((left, right) => right.length - left.length);
-  return (
-    sorted.find((supported) => model === supported || model.startsWith(`${supported}-`)) ?? model
-  );
 };
 
 const parseProbeErrorDetail = (raw: string): string => {
@@ -438,41 +339,133 @@ const loadCredentials = async (
   return { access, accountId };
 };
 
-const runProbeAttempt = async (
+const WhamWindowValueSchema = z.union([z.number(), z.string()]);
+
+const WhamWindowSchema = z
+  .object({
+    used_percent: WhamWindowValueSchema.optional(),
+    reset_at: WhamWindowValueSchema.optional(),
+    reset_after_seconds: WhamWindowValueSchema.optional(),
+    limit_window_seconds: WhamWindowValueSchema.optional(),
+  })
+  .catchall(z.unknown());
+
+const WhamRateLimitSchema = z
+  .object({
+    primary_window: z.unknown().optional(),
+    secondary_window: z.unknown().optional(),
+    five_hour: z.unknown().optional(),
+    five_hour_limit: z.unknown().optional(),
+    five_hour_rate_limit: z.unknown().optional(),
+    weekly: z.unknown().optional(),
+    weekly_limit: z.unknown().optional(),
+    weekly_rate_limit: z.unknown().optional(),
+    primary: z.unknown().optional(),
+    secondary: z.unknown().optional(),
+  })
+  .catchall(z.unknown());
+
+const WhamUsageSchema = z
+  .object({
+    plan_type: z.string().optional(),
+    rate_limit: WhamRateLimitSchema.optional(),
+  })
+  .catchall(z.unknown());
+
+type WhamWindow = {
+  used: number | null;
+  reset: string | null;
+  resetAtMs: number | null;
+  windowMinutes: number | null;
+};
+
+const SIX_HOURS_MINUTES = 6 * 60;
+const SIX_DAYS_MINUTES = 6 * 24 * 60;
+
+const parseWhamWindow = (raw: unknown, nowMs: number): WhamWindow | null => {
+  const parsed = WhamWindowSchema.safeParse(raw);
+  if (!parsed.success) return null;
+  const data = parsed.data;
+
+  const usedRaw = data.used_percent;
+  const used = usedRaw === undefined ? null : normalizeUsagePercent(String(usedRaw));
+
+  const resetRaw = data.reset_after_seconds ?? data.reset_at;
+  const reset = resetRaw === undefined ? null : normalizeResetValue(String(resetRaw), nowMs);
+  const resetAtMs = resetRaw === undefined ? null : normalizeResetAtMs(String(resetRaw), nowMs);
+
+  const windowRaw = data.limit_window_seconds;
+  const windowSeconds = windowRaw === undefined ? Number.NaN : Number.parseFloat(String(windowRaw));
+  const windowMinutes =
+    Number.isFinite(windowSeconds) && windowSeconds > 0 ? Math.round(windowSeconds / 60) : null;
+
+  if (used === null && reset === null && resetAtMs === null && windowMinutes === null) return null;
+  return { used, reset, resetAtMs, windowMinutes };
+};
+
+const classifyWhamWindows = (
+  rateLimit: Record<string, unknown>,
+  nowMs: number,
+): { primary: WhamWindow | null; secondary: WhamWindow | null } => {
+  const pick = (...keys: string[]): unknown => {
+    for (const key of keys) {
+      const value = rateLimit[key];
+      if (value !== undefined && value !== null) return value;
+    }
+    return undefined;
+  };
+
+  let primary = parseWhamWindow(
+    pick("primary_window", "five_hour", "five_hour_limit", "five_hour_rate_limit", "primary"),
+    nowMs,
+  );
+  let secondary = parseWhamWindow(
+    pick("secondary_window", "weekly", "weekly_limit", "weekly_rate_limit", "secondary"),
+    nowMs,
+  );
+
+  if (primary === null || secondary === null) {
+    for (const value of Object.values(rateLimit)) {
+      const candidate = parseWhamWindow(value, nowMs);
+      if (candidate === null || candidate.windowMinutes === null) continue;
+      if (primary === null && candidate.windowMinutes <= SIX_HOURS_MINUTES) {
+        primary = candidate;
+        continue;
+      }
+      if (secondary === null && candidate.windowMinutes >= SIX_DAYS_MINUTES) {
+        secondary = candidate;
+      }
+    }
+  }
+
+  return { primary, secondary };
+};
+
+const runWhamAttempt = async (
   access: string,
   accountId: string,
   options: {
-    model: string;
     timeoutMs: number;
     fetchImpl: typeof fetch;
     nowMs: number;
   },
 ): Promise<ProbeSnapshot> => {
-  const body = {
-    model: options.model,
-    instructions: "You are a coding assistant.",
-    input: [{ role: "user", content: [{ type: "input_text", text: "reply ok" }] }],
-    store: false,
-    stream: true,
-  };
-
   const timeoutSignal = AbortSignal.timeout(options.timeoutMs);
+  const headers: Record<string, string> = {
+    Authorization: `Bearer ${access}`,
+    accept: "application/json",
+    originator: "codex_cli_rs",
+  };
+  if (accountId.trim() !== "") {
+    headers["chatgpt-account-id"] = accountId;
+  }
 
   let response: Response;
   let responseText = "";
 
   try {
-    response = await options.fetchImpl(CODEX_URL, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${access}`,
-        "content-type": "application/json",
-        accept: "text/event-stream",
-        "openai-beta": "responses=experimental",
-        originator: "codex_cli_rs",
-        "chatgpt-account-id": accountId,
-      },
-      body: JSON.stringify(body),
+    response = await options.fetchImpl(CODEX_USAGE_URL, {
+      headers,
       signal: timeoutSignal,
     });
 
@@ -491,49 +484,48 @@ const runProbeAttempt = async (
     return toProbeError("error", detail, response.status);
   }
 
-  const usage = extractCompletedUsageFromSse(responseText);
-  const primaryUsedRaw = val(response.headers, "x-codex-primary-used-percent", "");
-  const secondaryUsedRaw = val(response.headers, "x-codex-secondary-used-percent", "");
-  const primaryResetSeconds = val(response.headers, "x-codex-primary-reset-after-seconds", "");
-  const secondaryResetSeconds = val(response.headers, "x-codex-secondary-reset-after-seconds", "");
-  const primaryWindowMinutesRaw = val(response.headers, "x-codex-primary-window-minutes", "");
-  const secondaryWindowMinutesRaw = val(response.headers, "x-codex-secondary-window-minutes", "");
-  const plan = val(response.headers, "x-codex-plan-type");
-  const profile = val(response.headers, "x-codex-bengalfox-limit-name");
-  const probeTokens = usage?.total_tokens ?? 0;
-  const primaryUsed = normalizeUsagePercent(primaryUsedRaw) ?? parseOptionalInt(primaryUsedRaw);
-  const secondaryUsed =
-    normalizeUsagePercent(secondaryUsedRaw) ?? parseOptionalInt(secondaryUsedRaw);
-  const primaryReset = parseOptionalDuration(primaryResetSeconds, options.nowMs);
-  const secondaryReset = parseOptionalDuration(secondaryResetSeconds, options.nowMs);
-  const primaryWindowMinutes = parseOptionalInt(primaryWindowMinutesRaw);
-  const secondaryWindowMinutes = parseOptionalInt(secondaryWindowMinutesRaw);
-  const hasWindowMinutes = primaryWindowMinutes !== null || secondaryWindowMinutes !== null;
-  const state =
-    primaryUsed !== null && secondaryUsed !== null
-      ? healthLabel(String(primaryUsed), String(secondaryUsed))
-      : healthLabel(primaryUsedRaw, secondaryUsedRaw);
-
-  const snapshot: ProbeSnapshot = {
-    status: state,
-    statusCode: response.status,
-    plan,
-    profile,
-    used: { primary: primaryUsed, secondary: secondaryUsed },
-    reset: { primary: primaryReset, secondary: secondaryReset },
-    probeTokens,
-  };
-  if (hasWindowMinutes) {
-    snapshot.windowMinutes = {
-      primary: primaryWindowMinutes,
-      secondary: secondaryWindowMinutes,
-    };
+  let payload: unknown;
+  try {
+    payload = JSON.parse(responseText);
+  } catch {
+    return toProbeError("error", "invalid usage response", "usage");
   }
+
+  const parsed = WhamUsageSchema.safeParse(payload);
+  if (!parsed.success || parsed.data.rate_limit === undefined) {
+    return toProbeError("error", "invalid usage response", "usage");
+  }
+
+  const { primary, secondary } = classifyWhamWindows(
+    parsed.data.rate_limit as Record<string, unknown>,
+    options.nowMs,
+  );
+  if (primary === null && secondary === null) {
+    return toProbeError("error", "no usable rate-limit data", "usage");
+  }
+
+  const status = healthLabel(String(primary?.used ?? ""), String(secondary?.used ?? ""));
+  const snapshot: ProbeSnapshot = {
+    status,
+    statusCode: 200,
+    used: { primary: primary?.used ?? null, secondary: secondary?.used ?? null },
+    reset: { primary: primary?.reset ?? null, secondary: secondary?.reset ?? null },
+    resetAtMs: { primary: primary?.resetAtMs ?? null, secondary: secondary?.resetAtMs ?? null },
+    probeTokens: 0,
+  };
+
+  const primaryMinutes = primary?.windowMinutes ?? null;
+  const secondaryMinutes = secondary?.windowMinutes ?? null;
+  if (primaryMinutes !== null || secondaryMinutes !== null) {
+    snapshot.windowMinutes = { primary: primaryMinutes, secondary: secondaryMinutes };
+  }
+
+  const plan = parsed.data.plan_type?.trim();
+  if (plan) snapshot.plan = plan;
   return snapshot;
 };
 
 export const probeQuota = async (options: ProbeQuotaOptions = {}): Promise<ProbeSnapshot> => {
-  const configuredModel = options.model?.trim() || resolveProbeModel(options.env);
   const retryCount = Math.min(
     options.retryCount ?? resolveProbeRetryCount(options.env),
     MAX_RETRY_COUNT,
@@ -547,18 +539,9 @@ export const probeQuota = async (options: ProbeQuotaOptions = {}): Promise<Probe
     return credentials;
   }
 
-  const resolvedModel = configuredModel
-    ? await canonicalizeConfiguredProbeModel(
-        configuredModel,
-        credentials.access,
-        credentials.accountId,
-        fetchImpl,
-      )
-    : await resolveDefaultProbeModel(credentials.access, credentials.accountId, fetchImpl);
-  if (typeof resolvedModel !== "string") return resolvedModel;
-
-  let snapshot = await runProbeAttempt(credentials.access, credentials.accountId, {
-    model: resolvedModel,
+  // Quota-only endpoint: spends no model quota and keeps working even when
+  // the model limit is exhausted.
+  let snapshot = await runWhamAttempt(credentials.access, credentials.accountId, {
     timeoutMs,
     fetchImpl,
     nowMs,
@@ -566,8 +549,7 @@ export const probeQuota = async (options: ProbeQuotaOptions = {}): Promise<Probe
 
   for (let attempt = 0; attempt < retryCount; attempt += 1) {
     if (!isRetryableProbeFailure(snapshot)) break;
-    snapshot = await runProbeAttempt(credentials.access, credentials.accountId, {
-      model: resolvedModel,
+    snapshot = await runWhamAttempt(credentials.access, credentials.accountId, {
       timeoutMs,
       fetchImpl,
       nowMs,

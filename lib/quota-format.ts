@@ -1,34 +1,3 @@
-import { z } from "zod";
-
-export type ProbeUsage = {
-  total_tokens?: number;
-};
-
-export type ProbeResult = {
-  status?: string;
-  statusCode?: string;
-  used?: string;
-  reset?: string;
-};
-
-const ProbeResultKeySchema = z.enum(["status", "statusCode", "used", "reset"]);
-
-const ResponseCompletedSchema = z.object({
-  type: z.literal("response.completed"),
-  response: z
-    .object({
-      usage: z
-        .object({
-          total_tokens: z
-            .number()
-            .optional()
-            .refine((value) => value === undefined || Number.isFinite(value)),
-        })
-        .optional(),
-    })
-    .optional(),
-});
-
 export const val = (headers: Headers, key: string, fallback = "-"): string => {
   const value = headers.get(key) ?? "";
   return value !== "" ? value : fallback;
@@ -60,44 +29,6 @@ export const healthLabel = (primaryRaw: string, secondaryRaw: string): string =>
   if (peak >= 90) return "critical";
   if (peak >= 75) return "warn";
   return "ok";
-};
-
-export const extractCompletedUsageFromSse = (text: string): ProbeUsage | null => {
-  const lines = text.split(/\r?\n/);
-
-  for (const line of lines) {
-    if (!line.startsWith("data: ")) continue;
-    const payload = line.slice(6);
-    if (!payload || payload === "[DONE]") continue;
-
-    try {
-      const completed = ResponseCompletedSchema.safeParse(JSON.parse(payload));
-      if (!completed.success) continue;
-      return completed.data.response?.usage ?? null;
-    } catch {
-      continue;
-    }
-  }
-
-  return null;
-};
-
-export const parseProbeLine = (line: string): ProbeResult => {
-  const result: ProbeResult = {};
-  const normalizedLine = line.trim();
-  if (normalizedLine === "") return result;
-
-  const tokens = normalizedLine.split(/\s+/);
-  for (const token of tokens) {
-    const idx = token.indexOf("=");
-    if (idx <= 0) continue;
-    const key = token.slice(0, idx);
-    const value = token.slice(idx + 1);
-    const parsedKey = ProbeResultKeySchema.safeParse(key);
-    if (!parsedKey.success) continue;
-    result[parsedKey.data] = value;
-  }
-  return result;
 };
 
 export const statusState = (raw: string | undefined): string => {

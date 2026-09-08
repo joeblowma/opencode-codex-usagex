@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import {
   formatProbeOutput,
+  normalizeResetAtMs,
   normalizeResetValue,
   normalizeUsagePercent,
   resolveProbeRetryCount,
@@ -108,6 +109,19 @@ test("normalizeResetValue accepts durations and timestamps", () => {
   assert.equal(normalizeResetValue(String(Math.floor(nowMs / 1000) + 3600), nowMs), "1h0m");
   assert.equal(normalizeResetValue(String(nowMs + 3_600_000), nowMs), "1h0m");
   assert.equal(normalizeResetValue("", nowMs), null);
+});
+
+test("normalizeResetAtMs keeps absolute reset moments as epoch ms", () => {
+  const nowMs = Date.UTC(2026, 0, 1, 0, 0, 0);
+  assert.equal(normalizeResetAtMs("3600", nowMs), nowMs + 3_600_000);
+  assert.equal(
+    normalizeResetAtMs(String(Math.floor(nowMs / 1000) + 3600), nowMs),
+    nowMs + 3_600_000,
+  );
+  assert.equal(normalizeResetAtMs(String(nowMs + 3_600_000), nowMs), nowMs + 3_600_000);
+  assert.equal(normalizeResetAtMs("", nowMs), null);
+  assert.equal(normalizeResetAtMs("nope", nowMs), null);
+  assert.equal(normalizeResetAtMs("-5", nowMs), null);
 });
 
 test("resolveProbeRetryCount parses env and bounds values", () => {

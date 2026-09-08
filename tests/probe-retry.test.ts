@@ -1,58 +1,56 @@
 import assert from "node:assert/strict";
-import { z } from "zod";
 import { isRetryableProbeFailure, probeQuota } from "#lib/codex-usage-probe.js";
 import { test } from "./test.ts";
-
-const ProbeRequestSchema = z.object({ model: z.string().optional() });
 
 const urlFromFetchInput = (input: Parameters<typeof fetch>[0]): string => {
   if (typeof input === "string") return input;
   return input instanceof URL ? input.href : input.url;
 };
 
-const probeRequestFromInit = (init: Parameters<typeof fetch>[1]) => {
-  if (typeof init?.body !== "string") {
-    throw new Error("expected string request body");
-  }
-  return ProbeRequestSchema.parse(JSON.parse(init.body));
+const whamSuccessResponse = (): Response => {
+  return new Response(
+    JSON.stringify({
+      plan_type: "plus",
+      rate_limit: {
+        primary_window: {
+          used_percent: 81,
+          reset_after_seconds: 3600,
+          limit_window_seconds: 18000,
+        },
+        secondary_window: {
+          used_percent: 9,
+          reset_after_seconds: 7200,
+          limit_window_seconds: 604800,
+        },
+      },
+    }),
+    { status: 200, headers: { "content-type": "application/json" } },
+  );
 };
 
-const successResponse = (): Response => {
-  return new Response("data: [DONE]\n", {
-    status: 200,
-    headers: {
-      "x-codex-primary-used-percent": "81",
-      "x-codex-secondary-used-percent": "9",
-      "x-codex-primary-reset-after-seconds": "3600",
-      "x-codex-secondary-reset-after-seconds": "7200",
-      "x-codex-primary-window-minutes": "300",
-      "x-codex-secondary-window-minutes": "10080",
-      "x-codex-plan-type": "plus",
-      "x-codex-bengalfox-limit-name": "default",
-    },
-  });
-};
-
-test("probeQuota retries once on network failure", async () => {
+test("probeQuota retries wham usage request once on network failure", async () => {
   let calls = 0;
-  const fetchImpl: typeof fetch = async () => {
+  const seenUrls: string[] = [];
+  const fetchImpl: typeof fetch = async (input) => {
     calls += 1;
+    seenUrls.push(urlFromFetchInput(input));
     if (calls === 1) {
       throw new Error("network down");
     }
-    return successResponse();
+    return whamSuccessResponse();
   };
 
   const snapshot = await probeQuota({
     retryCount: 1,
     fetchImpl,
     credentials: { accessToken: "token" },
-    model: "gpt-5.5",
   });
 
   assert.equal(calls, 2);
+  assert.ok(seenUrls.every((url) => url.includes("/wham/usage")));
   assert.equal(snapshot.status, "warn");
   assert.deepEqual(snapshot.used, { primary: 81, secondary: 9 });
+  assert.equal(snapshot.probeTokens, 0);
 });
 
 test("probeQuota does not retry auth/http 401 failures", async () => {
@@ -66,7 +64,6 @@ test("probeQuota does not retry auth/http 401 failures", async () => {
     retryCount: 2,
     fetchImpl,
     credentials: { accessToken: "token" },
-    model: "gpt-5.5",
   });
 
   assert.equal(calls, 1);
@@ -74,36 +71,14 @@ test("probeQuota does not retry auth/http 401 failures", async () => {
   assert.equal(snapshot.statusCode, 401);
 });
 
-test("probeQuota uses supported default model for ChatGPT account auth", async () => {
-  const seenModels: string[] = [];
+test("probeQuota reports unusable usage payloads without model calls", async () => {
   const seenUrls: string[] = [];
-  const fetchImpl: typeof fetch = async (input, init) => {
-    const url = urlFromFetchInput(input);
-    seenUrls.push(url);
-
-    if (url.includes("/codex/models")) {
-      assert.match(url, /client_version=1\.0\.0/);
-      return new Response(JSON.stringify({ models: [{ slug: "gpt-5.5" }] }), {
-        status: 200,
-        headers: { "content-type": "application/json" },
-      });
-    }
-
-    const body = probeRequestFromInit(init);
-    const model = body.model ?? "";
-    seenModels.push(model);
-
-    if (model === "gpt-5.3-codex") {
-      return new Response(
-        JSON.stringify({
-          detail:
-            "The 'gpt-5.3-codex' model is not supported when using Codex with a ChatGPT account.",
-        }),
-        { status: 400, headers: { "content-type": "application/json" } },
-      );
-    }
-
-    return successResponse();
+  const fetchImpl: typeof fetch = async (input) => {
+    seenUrls.push(urlFromFetchInput(input));
+    return new Response(JSON.stringify({ plan_type: "plus", rate_limit: {} }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
   };
 
   const snapshot = await probeQuota({
@@ -112,72 +87,10 @@ test("probeQuota uses supported default model for ChatGPT account auth", async (
     credentials: { accessToken: "token" },
   });
 
-  assert.equal(seenUrls[0]?.includes("/codex/models"), true);
-  assert.deepEqual(seenModels, ["gpt-5.5"]);
-  assert.equal(snapshot.statusCode, 200);
-});
-
-test("probeQuota ignores malformed model entries before a supported model", async () => {
-  let selectedModel = "";
-  const fetchImpl: typeof fetch = async (input, init) => {
-    if (urlFromFetchInput(input).includes("/codex/models")) {
-      return new Response(JSON.stringify({ models: [null, { slug: 42 }, { slug: "gpt-5.5" }] }), {
-        status: 200,
-        headers: { "content-type": "application/json" },
-      });
-    }
-
-    const body = probeRequestFromInit(init);
-    selectedModel = body.model ?? "";
-    return successResponse();
-  };
-
-  const snapshot = await probeQuota({
-    retryCount: 0,
-    fetchImpl,
-    credentials: { accessToken: "token" },
-  });
-
-  assert.equal(selectedModel, "gpt-5.5");
-  assert.equal(snapshot.statusCode, 200);
-});
-
-test("probeQuota canonicalizes OpenCode model variants to supported Codex slugs", async () => {
-  const seenModels: string[] = [];
-  const fetchImpl: typeof fetch = async (input, init) => {
-    const url = urlFromFetchInput(input);
-
-    if (url.includes("/codex/models")) {
-      return new Response(JSON.stringify({ models: [{ slug: "gpt-5.5" }] }), {
-        status: 200,
-        headers: { "content-type": "application/json" },
-      });
-    }
-
-    const body = probeRequestFromInit(init);
-    seenModels.push(body.model ?? "");
-    if (body.model === "gpt-5.5-fast") {
-      return new Response(
-        JSON.stringify({
-          detail:
-            "The 'gpt-5.5-fast' model is not supported when using Codex with a ChatGPT account.",
-        }),
-        { status: 400, headers: { "content-type": "application/json" } },
-      );
-    }
-
-    return successResponse();
-  };
-
-  const snapshot = await probeQuota({
-    retryCount: 0,
-    fetchImpl,
-    credentials: { accessToken: "token" },
-    model: "gpt-5.5-fast",
-  });
-
-  assert.deepEqual(seenModels, ["gpt-5.5"]);
-  assert.equal(snapshot.statusCode, 200);
+  assert.deepEqual(seenUrls, ["https://chatgpt.com/backend-api/wham/usage"]);
+  assert.equal(snapshot.status, "error");
+  assert.equal(snapshot.statusCode, "usage");
+  assert.equal(snapshot.error, "no usable rate-limit data");
 });
 
 test("probeQuota extracts JSON detail for probe errors", async () => {
@@ -192,7 +105,6 @@ test("probeQuota extracts JSON detail for probe errors", async () => {
     retryCount: 0,
     fetchImpl,
     credentials: { accessToken: "token" },
-    model: "gpt-5.5",
   });
 
   assert.equal(snapshot.status, "error");
@@ -212,47 +124,9 @@ test("probeQuota uses a valid error message when another error field is malforme
     retryCount: 0,
     fetchImpl,
     credentials: { accessToken: "token" },
-    model: "gpt-5.5",
   });
 
   assert.equal(snapshot.error, "Usable fallback");
-});
-
-test("probeQuota honors OPENCODE_CODEX_QUOTA_MODEL env override", async () => {
-  const seenModels: string[] = [];
-  const fetchImpl: typeof fetch = async (_input, init) => {
-    const body = probeRequestFromInit(init);
-    seenModels.push(body.model ?? "");
-    return successResponse();
-  };
-
-  const snapshot = await probeQuota({
-    fetchImpl,
-    credentials: { accessToken: "token" },
-    env: { OPENCODE_CODEX_QUOTA_MODEL: "gpt-5.3-codex" },
-  });
-
-  assert.deepEqual(seenModels, ["gpt-5.3-codex"]);
-  assert.equal(snapshot.statusCode, 200);
-});
-
-test("probeQuota model option overrides env model", async () => {
-  const seenModels: string[] = [];
-  const fetchImpl: typeof fetch = async (_input, init) => {
-    const body = probeRequestFromInit(init);
-    seenModels.push(body.model ?? "");
-    return successResponse();
-  };
-
-  const snapshot = await probeQuota({
-    fetchImpl,
-    credentials: { accessToken: "token" },
-    model: "gpt-codex",
-    env: { OPENCODE_CODEX_QUOTA_MODEL: "gpt-5.3-codex" },
-  });
-
-  assert.deepEqual(seenModels, ["gpt-codex"]);
-  assert.equal(snapshot.statusCode, 200);
 });
 
 test("probeQuota does not retry when retry count is disabled", async () => {
@@ -269,6 +143,7 @@ test("probeQuota does not retry when retry count is disabled", async () => {
   });
 
   assert.equal(calls, 1);
+  assert.equal(snapshot.status, "error");
   assert.equal(snapshot.statusCode, "network");
 });
 
