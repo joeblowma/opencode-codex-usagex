@@ -138,8 +138,10 @@ npm unlink -g opencode-codex-usage
 
 ## Behavior
 
-- Background checks run on startup and on interval.
-- Background checks trigger a toast only when status meets the configured threshold and gets worse than the previous background state.
+- Background checks run on startup and every 2 minutes.
+- Quota is read from the dedicated `GET /backend-api/wham/usage` endpoint, which spends no model quota and keeps working when the model limit is exhausted. The plugin never sends model requests.
+- Background checks trigger a toast only when status meets the configured threshold and gets worse than the previous background state. Set the threshold to `never` to keep the sidebar panel only.
+- The sidebar panel keeps the last known good snapshot and marks it `stale` when a probe fails, instead of blanking to an error.
 - Manual runs can trigger an immediate refresh from any folder.
 - Window labels use API-provided window minutes when available (for example `5h window`, `7d window`), otherwise fallback to `window A` / `window B`.
 
@@ -155,7 +157,7 @@ Set polling interval (milliseconds):
 OPENCODE_CODEX_QUOTA_POLL_MS=120000
 ```
 
-Default is `600000` (10 minutes). Invalid or non-positive values fall back to default.
+Default is `120000` (2 minutes). Invalid or non-positive values fall back to default.
 
 Set transient retry count for probe failures:
 
@@ -164,14 +166,6 @@ OPENCODE_CODEX_QUOTA_RETRY_COUNT=1
 ```
 
 Allowed values: `0`, `1` (default), `2`. Values above `2` clamp to `2`; invalid values fall back to default.
-
-Set probe model (advanced; optional):
-
-```bash
-OPENCODE_CODEX_QUOTA_MODEL=gpt-5.5
-```
-
-By default, the probe queries the authenticated Codex model list and uses the first supported model returned for the account.
 
 Advanced: override the internal refresh path (optional):
 
