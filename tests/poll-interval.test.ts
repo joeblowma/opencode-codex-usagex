@@ -1,6 +1,11 @@
 import assert from "node:assert/strict";
-import { resolvePollMs } from "#lib/codex-usage-toast-plugin.js";
+import { DEFAULT_POLL_MS, resolvePollMs } from "#lib/codex-usage-toast-plugin.js";
 import { test } from "./test.ts";
+
+test("default poll interval is two minutes", () => {
+  assert.equal(DEFAULT_POLL_MS, 120_000);
+  assert.equal(resolvePollMs({}), 120_000);
+});
 
 test("uses default interval when env var is not set", () => {
   assert.equal(resolvePollMs({}, 600_000), 600_000);

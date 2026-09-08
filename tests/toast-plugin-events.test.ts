@@ -7,8 +7,6 @@ import {
   isSessionDeletedEvent,
   isSessionActivityEvent,
   isSessionCreatedEvent,
-  isSupportedProbeModel,
-  resolveModelFromEventProperties,
 } from "#lib/codex-usage-toast-plugin.js";
 import { test } from "./test.ts";
 
@@ -72,66 +70,4 @@ test("matches file watcher namespace event types", () => {
   assert.equal(isFileWatcherEvent("file.watcher.updated"), true);
   assert.equal(isFileWatcherEvent("file.watcher.created"), true);
   assert.equal(isFileWatcherEvent("file.edited"), false);
-});
-
-test("extracts model from common session event property shapes", () => {
-  assert.equal(resolveModelFromEventProperties({ model: "gpt-5.3-codex" }), "gpt-5.3-codex");
-  assert.equal(resolveModelFromEventProperties({ modelName: "gpt-codex" }), "gpt-codex");
-  assert.equal(
-    resolveModelFromEventProperties({
-      session: { model: "gpt-5.3-codex" },
-    }),
-    "gpt-5.3-codex",
-  );
-  assert.equal(
-    resolveModelFromEventProperties({
-      session: { modelName: "gpt-codex" },
-    }),
-    "gpt-codex",
-  );
-});
-
-test("ignores empty or non-string model values in event properties", () => {
-  assert.equal(resolveModelFromEventProperties(undefined), undefined);
-  assert.equal(resolveModelFromEventProperties({ model: "   " }), undefined);
-  assert.equal(resolveModelFromEventProperties({ model: 123 }), undefined);
-  assert.equal(resolveModelFromEventProperties({ session: { model: "" } }), undefined);
-});
-
-test("extracts modelID from message.updated user-message shape", () => {
-  assert.equal(
-    resolveModelFromEventProperties({
-      info: {
-        role: "user",
-        model: { providerID: "openai", modelID: "gpt-5.3-codex" },
-      },
-    }),
-    "gpt-5.3-codex",
-  );
-});
-
-test("extracts modelID from message.updated assistant-message shape", () => {
-  assert.equal(
-    resolveModelFromEventProperties({
-      info: {
-        role: "assistant",
-        providerID: "openai",
-        modelID: "gpt-5.3-codex",
-      },
-    }),
-    "gpt-5.3-codex",
-  );
-});
-
-test("accepts codex and gpt models for quota probes", () => {
-  assert.equal(isSupportedProbeModel("gpt-5.3-codex"), true);
-  assert.equal(isSupportedProbeModel("gpt-4.1"), true);
-  assert.equal(isSupportedProbeModel("gpt-5"), true);
-});
-
-test("rejects non-codex and non-gpt models for quota probes", () => {
-  assert.equal(isSupportedProbeModel("claude-sonnet-4"), false);
-  assert.equal(isSupportedProbeModel("llama"), false);
-  assert.equal(isSupportedProbeModel(""), false);
-  assert.equal(isSupportedProbeModel("   "), false);
 });

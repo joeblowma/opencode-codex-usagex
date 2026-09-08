@@ -5,7 +5,7 @@ import { probeQuota, type ProbeSnapshot } from "./codex-usage-probe.js";
 import { statusState } from "./quota-format.js";
 import { resolveSignalPath } from "./codex-usage-signal.js";
 
-const DEFAULT_POLL_MS = 10 * 60 * 1000;
+export const DEFAULT_POLL_MS = 2 * 60 * 1000;
 const POLL_MS_ENV = "OPENCODE_CODEX_QUOTA_POLL_MS";
 const TOAST_THRESHOLD_ENV = "OPENCODE_CODEX_QUOTA_TOAST_THRESHOLD";
 const TOAST_DURATION_MS_ENV = "OPENCODE_CODEX_QUOTA_TOAST_DURATION_MS";
@@ -55,7 +55,6 @@ const ToastThresholdSchema = z.preprocess(
 );
 
 const PropertyRecordSchema = z.record(z.string(), z.unknown());
-const NonEmptyStringSchema = z.string().trim().min(1);
 const TextValueSchema = z.union([z.string(), z.number(), z.boolean()]);
 
 const pairFromText = (raw: string): [string, string] => {
@@ -76,48 +75,6 @@ const textFromUnknown = (value: unknown): string => {
 const stringFromUnknown = (value: unknown): string | undefined => {
   const parsed = z.string().safeParse(value);
   return parsed.success ? parsed.data : undefined;
-};
-
-const nonEmptyStringFromUnknown = (value: unknown): string | undefined => {
-  const parsed = NonEmptyStringSchema.safeParse(value);
-  return parsed.success ? parsed.data : undefined;
-};
-
-export const resolveModelFromEventProperties = (
-  properties: Record<string, unknown> | undefined,
-): string | undefined => {
-  if (!properties) return undefined;
-
-  const directModel = nonEmptyStringFromUnknown(properties.model);
-  if (directModel) return directModel;
-
-  const directModelName = nonEmptyStringFromUnknown(properties.modelName);
-  if (directModelName) return directModelName;
-
-  const directModelId = nonEmptyStringFromUnknown(properties.modelID);
-  if (directModelId) return directModelId;
-
-  const info = PropertyRecordSchema.safeParse(properties.info);
-  if (info.success) {
-    const infoModelId = nonEmptyStringFromUnknown(info.data.modelID);
-    if (infoModelId) return infoModelId;
-
-    const infoModel = PropertyRecordSchema.safeParse(info.data.model);
-    if (infoModel.success) {
-      const nestedModelId = nonEmptyStringFromUnknown(infoModel.data.modelID);
-      if (nestedModelId) return nestedModelId;
-
-      const nestedModelName = nonEmptyStringFromUnknown(infoModel.data.modelName);
-      if (nestedModelName) return nestedModelName;
-    }
-  }
-
-  const session = PropertyRecordSchema.safeParse(properties.session);
-  if (!session.success) return undefined;
-  return (
-    nonEmptyStringFromUnknown(session.data.model) ??
-    nonEmptyStringFromUnknown(session.data.modelName)
-  );
 };
 
 const pairFromUnknown = (value: unknown): [string, string] => {
@@ -230,12 +187,6 @@ export const isFileWatcherEvent = (eventType: unknown): boolean => {
 
 export const isCommandExecutedEvent = (eventType: unknown): boolean => {
   return eventType === "command.executed";
-};
-
-export const isSupportedProbeModel = (model: string | undefined): boolean => {
-  const normalized = model?.trim().toLowerCase();
-  if (!normalized) return false;
-  return normalized.includes("codex") || normalized.startsWith("gpt-");
 };
 
 type QuotaStatusState = "ok" | "warn" | "critical" | "error" | "unknown";
@@ -441,7 +392,6 @@ export const CodexQuotaToastPlugin = ({ client, worktree }: PluginContext) => {
   let pendingForce = false;
   let started = false;
   let lastBackgroundStatus: QuotaStatusState | undefined;
-  let sessionModel: string | undefined;
   let pollTimer: ReturnType<typeof setInterval> | undefined;
   let triggerTimer: ReturnType<typeof setInterval> | undefined;
   const signalPath = resolveSignalPath();
@@ -496,7 +446,7 @@ export const CodexQuotaToastPlugin = ({ client, worktree }: PluginContext) => {
     running = true;
 
     try {
-      const parsed = await probeQuota({ model: sessionModel });
+      const parsed = await probeQuota();
       const probeError = parsed.error?.trim();
       if (probeError) {
         await logPluginError("quota probe failed", { detail: probeError, worktree });
@@ -633,7 +583,6 @@ export const CodexQuotaToastPlugin = ({ client, worktree }: PluginContext) => {
   const stopBackgroundWorkersAndReset = (): void => {
     started = false;
     lastBackgroundStatus = undefined;
-    sessionModel = undefined;
     stopBackgroundWorkers();
   };
 
@@ -650,11 +599,6 @@ export const CodexQuotaToastPlugin = ({ client, worktree }: PluginContext) => {
       >;
     }) => {},
     event: ({ event }: { event: PluginEvent }) => {
-      const eventModel = resolveModelFromEventProperties(event.properties);
-      if (isSupportedProbeModel(eventModel)) {
-        sessionModel = eventModel;
-      }
-
       if (isSessionCreatedEvent(event.type)) {
         restartBackgroundWorkers();
         return;
