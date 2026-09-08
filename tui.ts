@@ -1,18 +1,29 @@
 import { appendFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { createSignal } from "solid-js";
 import { probeQuota } from "./lib/codex-usage-probe.js";
 import {
-  DEFAULT_POLL_MS,
+  resolvePollMs,
   resolveToastDurationMs,
   toastBodyFromParsed,
 } from "./lib/codex-usage-toast-plugin.js";
+import {
+  buildSidebarComponent,
+  type PanelView,
+  type SidebarSolidRuntime,
+  type TuiSidebarApi,
+} from "./lib/tui-sidebar.js";
 
 type TuiToast = {
   title?: string;
   message: string;
   variant?: "info" | "success" | "warning" | "error";
   duration?: number;
+};
+
+type SidebarSlotProps = {
+  readonly session_id: string;
 };
 
 type TuiApi = {
@@ -37,97 +48,20 @@ type TuiApi = {
   slots?: {
     register: (registration: {
       order?: number;
-      slots: { sidebar_content: (props: { session_id: string }) => unknown };
+      slots: { sidebar_content: (context: unknown, props: SidebarSlotProps) => unknown };
     }) => string;
   };
-  state?: {
-    session: {
-      get: (sessionId: string) =>
-        | {
-            tokens?: {
-              input?: number;
-              output?: number;
-              reasoning?: number;
-              cache?: { read?: number; write?: number };
-            };
-          }
-        | undefined;
-    };
-  };
+  state?: TuiSidebarApi["state"];
   renderer?: { requestRender: () => void };
+  event?: {
+    on: (
+      type: "message.updated" | "message.removed" | "message.part.updated",
+      handler: (event: { properties: { sessionID: string } }) => void,
+    ) => () => void;
+  };
 };
 
-type SolidRuntime = {
-  createElement: (kind: string) => unknown;
-  setProp: (element: unknown, name: string, value: unknown) => void;
-  insert: (parent: unknown, child: unknown) => void;
-};
-
-type QuotaSnapshot = Awaited<ReturnType<typeof probeQuota>>;
-
-const formatNumber = (value: number | null | undefined): string => {
-  return typeof value === "number" && Number.isFinite(value) ? value.toLocaleString() : "-";
-};
-
-const remainingText = (value: number | null | undefined): string => {
-  return typeof value === "number" && Number.isFinite(value)
-    ? `${Math.max(0, Math.min(100, 100 - value))}% left`
-    : "-";
-};
-
-const panelText = (solid: SolidRuntime, text: string): unknown => {
-  const node = solid.createElement("text");
-  solid.insert(node, text);
-  return node;
-};
-
-const buildSidebarPanel = (
-  solid: SolidRuntime,
-  api: TuiApi,
-  snapshot: QuotaSnapshot | undefined,
-  lastGood: QuotaSnapshot | undefined,
-  sessionId: string,
-): unknown => {
-  const box = solid.createElement("box");
-  solid.setProp(box, "flexDirection", "column");
-  solid.setProp(box, "paddingLeft", 1);
-  solid.setProp(box, "paddingRight", 1);
-
-  const title = solid.createElement("text");
-  solid.setProp(title, "fg", "cyan");
-  solid.insert(title, "Codex quota");
-  solid.insert(box, title);
-
-  const view = snapshot && !snapshot.error ? snapshot : lastGood;
-  const stale = snapshot?.error !== undefined && snapshot.error !== "" && view === lastGood;
-  const used = view?.used;
-  const reset = view?.reset;
-  if (used && typeof used === "object" && reset && typeof reset === "object") {
-    solid.insert(
-      box,
-      panelText(solid, `5h: ${remainingText(used.primary)} · ${reset.primary ?? "-"}`),
-    );
-    solid.insert(
-      box,
-      panelText(solid, `7d: ${remainingText(used.secondary)} · ${reset.secondary ?? "-"}`),
-    );
-    if (stale) {
-      solid.insert(box, panelText(solid, "stale · last known"));
-    }
-  } else {
-    solid.insert(box, panelText(solid, snapshot?.error ? "Quota: error" : "Quota: loading…"));
-  }
-
-  const tokens = api.state?.session.get(sessionId)?.tokens;
-  if (tokens) {
-    solid.insert(box, panelText(solid, `input: ${formatNumber(tokens.input)}`));
-    solid.insert(box, panelText(solid, `output: ${formatNumber(tokens.output)}`));
-    solid.insert(box, panelText(solid, `cache: ${formatNumber(tokens.cache?.read)}`));
-  }
-
-  return box;
-};
-
+const COUNTDOWN_TICK_MS = 30_000;
 const TUI_DEBUG_ENV = "OPENCODE_CODEX_USAGE_TUI_DEBUG";
 const debugLogPath = path.join(os.tmpdir(), "opencode-codex-usage-tui-debug.log");
 
@@ -144,13 +78,23 @@ const debugLog = (message: string, extra: Record<string, unknown> = {}): void =>
 
 export const CodexQuotaTuiPlugin = async (
   api: TuiApi,
-  injected?: { solid?: SolidRuntime },
+  injected?: { solid?: SidebarSolidRuntime },
 ): Promise<void> => {
   const toastDurationMs = resolveToastDurationMs();
+  const pollMs = resolvePollMs();
   let running = false;
-  let latestSnapshot: QuotaSnapshot | undefined;
-  let lastGoodSnapshot: QuotaSnapshot | undefined;
+  // Reactive panel state. The host renders sidebar_content once as a Solid
+  // tree; quota lines subscribe to these signals, so polls and countdown
+  // ticks update the visible text without re-invoking the slot function.
+  const [panelView, setPanelView] = createSignal<PanelView>({
+    latest: undefined,
+    lastGood: undefined,
+  });
+  const [nowMs, setNowMs] = createSignal(Date.now());
+  const [usageRevision, setUsageRevision] = createSignal(0);
   let pollTimer: ReturnType<typeof setInterval> | undefined;
+  let countdownTimer: ReturnType<typeof setInterval> | undefined;
+  const eventDisposers: Array<() => void> = [];
   // NOTE: api.slots.register() returns a host-assigned slot id (string), not an
   // unregister function. Slot registrations are tracked and disposed by the TUI
   // runtime automatically, so there is nothing to call here on cleanup.
@@ -160,8 +104,16 @@ export const CodexQuotaTuiPlugin = async (
     if (running) return;
     running = true;
     try {
-      latestSnapshot = await probeQuota();
-      if (!latestSnapshot.error) lastGoodSnapshot = latestSnapshot;
+      const snapshot = await probeQuota();
+      const previous = panelView();
+      setPanelView({
+        latest: snapshot,
+        lastGood: snapshot.error ? previous.lastGood : snapshot,
+      });
+      debugLog("sidebar refreshed", {
+        hasError: snapshot.error ?? "",
+        status: snapshot.status,
+      });
       api.renderer?.requestRender();
     } finally {
       running = false;
@@ -172,17 +124,35 @@ export const CodexQuotaTuiPlugin = async (
   // under plain node --test, so tests inject a fake runtime instead.
   const solid =
     injected?.solid ??
-    ((await import("@opentui/solid").catch(() => undefined)) as SolidRuntime | undefined);
+    ((await import("@opentui/solid").catch(() => undefined)) as SidebarSolidRuntime | undefined);
   if (solid && api.slots) {
+    const QuotaPanel = buildSidebarComponent(solid, api, {
+      view: panelView,
+      now: nowMs,
+      usageRevision,
+    });
     slotId = api.slots.register({
       order: 900,
       slots: {
-        sidebar_content: ({ session_id }) =>
-          buildSidebarPanel(solid, api, latestSnapshot, lastGoodSnapshot, session_id),
+        sidebar_content: (_context, props) => {
+          const sessionId = props.session_id;
+          return solid.createComponent(QuotaPanel, { sessionId });
+        },
       },
     });
-    pollTimer = setInterval(() => void refreshSidebar(), DEFAULT_POLL_MS);
+    pollTimer = setInterval(() => void refreshSidebar(), pollMs);
+    countdownTimer = setInterval(() => setNowMs(Date.now()), COUNTDOWN_TICK_MS);
     void refreshSidebar();
+  }
+
+  if (api.event) {
+    const refreshTokenUsage = (): void => {
+      setUsageRevision((revision) => revision + 1);
+      api.renderer?.requestRender();
+    };
+    eventDisposers.push(api.event.on("message.updated", refreshTokenUsage));
+    eventDisposers.push(api.event.on("message.removed", refreshTokenUsage));
+    eventDisposers.push(api.event.on("message.part.updated", refreshTokenUsage));
   }
 
   debugLog("tui plugin loaded", {
@@ -200,6 +170,12 @@ export const CodexQuotaTuiPlugin = async (
   }
 
   const showToast = (toast: TuiToast): void => {
+    debugLog("toast shown", {
+      title: toast.title ?? "",
+      variant: toast.variant ?? "",
+      duration: toast.duration ?? 0,
+      messageLength: toast.message.length,
+    });
     api.ui.toast(toast);
   };
 
@@ -260,6 +236,8 @@ export const CodexQuotaTuiPlugin = async (
   api.lifecycle.onDispose(() => {
     debugLog("tui plugin disposed", { slotId });
     if (pollTimer) clearInterval(pollTimer);
+    if (countdownTimer) clearInterval(countdownTimer);
+    for (const disposeEvent of eventDisposers) disposeEvent();
     dispose();
   });
 };
