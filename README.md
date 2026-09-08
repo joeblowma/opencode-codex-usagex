@@ -7,7 +7,7 @@
 
 No dashboard tab. No extra model request. No noisy UI. Just a small server plugin and TUI plugin that show the information you need inside OpenCode.
 
-![Codex quota toast in OpenCode](screenshot.png)
+![Codex quota and session token usage in the OpenCode TUI sidebar](screenshot.png)
 
 ## Why this plugin exists
 
@@ -16,7 +16,7 @@ Codex quota is easy to forget until a request fails. `opencode-codex-usage` puts
 - quota windows and remaining percentage in the OpenCode TUI sidebar;
 - input, output, and cache read/write usage for the current session;
 - on-demand quota refreshes through `/codex-usage`;
-- low-noise background notifications when a quota window reaches a configured threshold.
+- optional low-noise background notifications when a quota window reaches a configured threshold.
 
 It is intentionally focused. It does not manage models, change provider routing, proxy prompts, or replace OpenCode authentication.
 
@@ -29,7 +29,7 @@ It is intentionally focused. It does not manage models, change provider routing,
 - **Separate cache accounting** — displays cache read and cache write values independently.
 - **Manual refresh command** — `/codex-usage` runs a local probe without an assistant turn.
 - **Background polling** — starts on plugin load and repeats every two minutes by default.
-- **Threshold-based toasts** — background notifications appear only when the configured severity threshold is reached and the state worsens.
+- **Optional threshold-based toasts** — background notifications can be disabled completely with `OPENCODE_CODEX_QUOTA_TOAST_THRESHOLD=never`.
 - **Stale-data protection** — a failed probe keeps the last known good quota snapshot and marks it as stale instead of blanking the panel.
 - **CLI output** — compact JSON for automation and a readable `--pretty` view for humans.
 - **Transient retries** — network and timeout failures can be retried without retrying authentication or HTTP errors.
