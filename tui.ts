@@ -1,245 +1,191 @@
-import { appendFile } from "node:fs/promises";
-import os from "node:os";
-import path from "node:path";
-import { createSignal } from "solid-js";
-import { probeQuota } from "./lib/codex-usage-probe.js";
+import { Plugin } from "@opencode/plugin/tui";
+import { createEffect, createMemo, createSignal } from "solid-js";
+import type { SessionMessageInfo } from "@opencode/client";
 import {
   resolvePollMs,
   resolveToastDurationMs,
   toastBodyFromParsed,
 } from "./lib/codex-usage-toast-plugin.js";
-import {
-  buildSidebarComponent,
-  type PanelView,
-  type SidebarSolidRuntime,
-  type TuiSidebarApi,
-} from "./lib/tui-sidebar.js";
-
-type TuiToast = {
-  title?: string;
-  message: string;
-  variant?: "info" | "success" | "warning" | "error";
-  duration?: number;
-};
-
-type SidebarSlotProps = {
-  readonly session_id: string;
-};
-
-type TuiApi = {
-  command: {
-    register: (
-      callback: () => Array<{
-        title: string;
-        value: string;
-        description: string;
-        category: string;
-        slash: { name: string };
-        onSelect: () => void;
-      }>,
-    ) => () => void;
-  };
-  ui: {
-    toast: (input: TuiToast) => void;
-  };
-  lifecycle: {
-    onDispose: (dispose: () => void) => () => void;
-  };
-  slots?: {
-    register: (registration: {
-      order?: number;
-      slots: { sidebar_content: (context: unknown, props: SidebarSlotProps) => unknown };
-    }) => string;
-  };
-  state?: TuiSidebarApi["state"];
-  renderer?: { requestRender: () => void };
-  event?: {
-    on: (
-      type: "message.updated" | "message.removed" | "message.part.updated",
-      handler: (event: { properties: { sessionID: string } }) => void,
-    ) => () => void;
-  };
-};
+import { CODEX_USAGE_RPC, ProbeSnapshotSchema } from "./lib/opencode2-rpc.js";
+import type { ProbeSnapshot } from "./lib/codex-usage-probe.js";
+import { SidebarPanel, type SidebarColors } from "./lib/sidebar-panel.js";
+import { isQuotaProvider, nextPanelView, usageFromMessages } from "./lib/sidebar-state.js";
+import type { PanelView } from "./lib/sidebar-text.js";
+import type { UsageMessage } from "./lib/session-token-usage.js";
 
 const COUNTDOWN_TICK_MS = 30_000;
-const TUI_DEBUG_ENV = "OPENCODE_CODEX_USAGE_TUI_DEBUG";
-const debugLogPath = path.join(os.tmpdir(), "opencode-codex-usage-tui-debug.log");
 
-const debugEnabled = (): boolean => {
-  const value = process.env[TUI_DEBUG_ENV]?.trim().toLowerCase();
-  return value === "1" || value === "true" || value === "yes";
-};
-
-const debugLog = (message: string, extra: Record<string, unknown> = {}): void => {
-  if (!debugEnabled()) return;
-  const line = JSON.stringify({ time: new Date().toISOString(), message, ...extra });
-  void appendFile(debugLogPath, `${line}\n`, "utf8").catch(() => undefined);
-};
-
-export const CodexQuotaTuiPlugin = async (
-  api: TuiApi,
-  injected?: { solid?: SidebarSolidRuntime },
-): Promise<void> => {
-  const toastDurationMs = resolveToastDurationMs();
-  const pollMs = resolvePollMs();
-  let running = false;
-  // Reactive panel state. The host renders sidebar_content once as a Solid
-  // tree; quota lines subscribe to these signals, so polls and countdown
-  // ticks update the visible text without re-invoking the slot function.
-  const [panelView, setPanelView] = createSignal<PanelView>({
-    latest: undefined,
-    lastGood: undefined,
+const usageMessages = (messages: readonly SessionMessageInfo[]): UsageMessage[] => {
+  return messages.flatMap((message) => {
+    if (message.type !== "assistant") return [];
+    return [{ id: message.id, role: "assistant", tokens: message.tokens }];
   });
-  const [nowMs, setNowMs] = createSignal(Date.now());
-  const [usageRevision, setUsageRevision] = createSignal(0);
-  let pollTimer: ReturnType<typeof setInterval> | undefined;
-  let countdownTimer: ReturnType<typeof setInterval> | undefined;
-  const eventDisposers: Array<() => void> = [];
-  // NOTE: api.slots.register() returns a host-assigned slot id (string), not an
-  // unregister function. Slot registrations are tracked and disposed by the TUI
-  // runtime automatically, so there is nothing to call here on cleanup.
-  let slotId: string | undefined;
+};
 
-  const refreshSidebar = async (): Promise<void> => {
-    if (running) return;
-    running = true;
-    try {
-      const snapshot = await probeQuota();
-      const previous = panelView();
-      setPanelView({
-        latest: snapshot,
-        lastGood: snapshot.error ? previous.lastGood : snapshot,
-      });
-      debugLog("sidebar refreshed", {
-        hasError: snapshot.error ?? "",
-        status: snapshot.status,
-      });
-      api.renderer?.requestRender();
-    } finally {
-      running = false;
-    }
-  };
+export const CodexQuotaTuiPlugin = Plugin.define({
+  id: "opencode-codex-usage",
+  setup(ctx) {
+    const pollMs = resolvePollMs();
+    const toastDurationMs = resolveToastDurationMs();
 
-  // `injected.solid` is a test seam: @opentui/solid needs Bun FFI and cannot load
-  // under plain node --test, so tests inject a fake runtime instead.
-  const solid =
-    injected?.solid ??
-    ((await import("@opentui/solid").catch(() => undefined)) as SidebarSolidRuntime | undefined);
-  if (solid && api.slots) {
-    const QuotaPanel = buildSidebarComponent(solid, api, {
-      view: panelView,
-      now: nowMs,
-      usageRevision,
+    const [panelView, setPanelView] = createSignal<PanelView>({
+      latest: undefined,
+      lastGood: undefined,
     });
-    slotId = api.slots.register({
-      order: 900,
-      slots: {
-        sidebar_content: (_context, props) => {
-          const sessionId = props.session_id;
-          return solid.createComponent(QuotaPanel, { sessionId });
-        },
-      },
-    });
-    pollTimer = setInterval(() => void refreshSidebar(), pollMs);
-    countdownTimer = setInterval(() => setNowMs(Date.now()), COUNTDOWN_TICK_MS);
-    void refreshSidebar();
-  }
+    const [nowMs, setNowMs] = createSignal(Date.now());
+    const [usageRevision, setUsageRevision] = createSignal(0);
+    const [quotaVisible, setQuotaVisible] = createSignal(false);
 
-  if (api.event) {
-    const refreshTokenUsage = (): void => {
-      setUsageRevision((revision) => revision + 1);
-      api.renderer?.requestRender();
+    let running = false;
+
+    /**
+     * Records a failure as panel state. The RPC can reject (transport) or hand
+     * back an error snapshot; either way the panel must leave "loading…", so
+     * the sidebar reports the failure instead of appearing stuck.
+     */
+    const recordFailure = (detail: string): ProbeSnapshot => {
+      const snapshot: ProbeSnapshot = { status: "error", statusCode: "rpc", error: detail };
+
+      setPanelView((previous) => nextPanelView(previous, snapshot));
+
+      return snapshot;
     };
-    eventDisposers.push(api.event.on("message.updated", refreshTokenUsage));
-    eventDisposers.push(api.event.on("message.removed", refreshTokenUsage));
-    eventDisposers.push(api.event.on("message.part.updated", refreshTokenUsage));
-  }
 
-  debugLog("tui plugin loaded", {
-    hasCommandRegister: typeof api.command?.register,
-    hasToast: typeof api.ui?.toast,
-  });
+    const readQuota = async (): Promise<ProbeSnapshot> => {
+      try {
+        const snapshot = ProbeSnapshotSchema.parse(await ctx.client.rpc(CODEX_USAGE_RPC).usage({}));
 
-  if (debugEnabled()) {
-    api.ui.toast({
-      title: "Codex usage debug",
-      message: `/codex-usage TUI plugin loaded; log: ${debugLogPath}`,
-      variant: "info",
-      duration: 10_000,
+        setPanelView((previous) => nextPanelView(previous, snapshot));
+
+        return snapshot;
+      } catch (error: unknown) {
+        return recordFailure(error instanceof Error ? error.message : String(error));
+      }
+    };
+
+    const refresh = async () => {
+      if (running) return;
+      running = true;
+      try {
+        await readQuota();
+      } finally {
+        running = false;
+      }
+    };
+
+    const showQuotaToast = async () => {
+      const snapshot = await readQuota();
+
+      ctx.ui.toast.show(toastBodyFromParsed(snapshot, toastDurationMs));
+    };
+
+    // Reading the route reactively catches model switches as well as navigation.
+    const selection = createMemo(() => {
+      const route = ctx.ui.router.current();
+
+      if (route.type !== "session") return undefined;
+
+      const session = ctx.data.session.get(route.sessionID);
+
+      return { sessionID: route.sessionID, providerID: session?.model?.providerID };
     });
-  }
 
-  const showToast = (toast: TuiToast): void => {
-    debugLog("toast shown", {
-      title: toast.title ?? "",
-      variant: toast.variant ?? "",
-      duration: toast.duration ?? 0,
-      messageLength: toast.message.length,
-    });
-    api.ui.toast(toast);
-  };
+    // Quota belongs to the ChatGPT account behind OpenAI models only. Token
+    // usage is per session and stays visible regardless of provider.
+    createEffect(() => {
+      const current = selection();
 
-  const runProbe = async (): Promise<void> => {
-    debugLog("run probe requested", { running });
-    if (running) return;
-    running = true;
+      if (!current) {
+        setQuotaVisible(false);
 
-    try {
-      const parsed = await probeQuota();
-      const probeError = parsed.error?.trim();
-      if (probeError) {
-        showToast({
-          title: "Codex quota 🚨",
-          message: `🚨 Quota error | ${probeError}`,
-          variant: "error",
-          duration: toastDurationMs,
-        });
         return;
       }
 
-      showToast(toastBodyFromParsed(parsed, toastDurationMs));
-    } catch (error: unknown) {
-      const detail = error instanceof Error ? error.message : String(error);
-      showToast({
-        title: "Codex quota 🚨",
-        message: `🚨 Quota error | ${detail}`,
-        variant: "error",
-        duration: toastDurationMs,
-      });
-    } finally {
-      running = false;
-    }
-  };
+      setQuotaVisible(isQuotaProvider(current.providerID));
+    });
 
-  const dispose = api.command.register(() => [
-    ...(() => {
-      const command = {
-        title: "Codex usage",
-        value: "codex-usage",
-        description: "Show Codex quota",
-        category: "Codex",
-        slash: { name: "codex-usage" },
-        onSelect: () => {
-          debugLog("command selected");
-          void runProbe();
+    // Colors come from the resolved host theme so the block follows light/dark
+    // and any custom palette instead of baking in a fixed foreground. An absent
+    // theme resolves to undefined, leaving `fg` unset so the host foreground wins.
+    const colors = (): SidebarColors | undefined => {
+      const text = ctx.theme?.text;
+
+      if (!text?.base) return undefined;
+
+      return { base: text.base, muted: text.muted ?? text.base };
+    };
+
+    const releaseSlot = ctx.ui.slot({
+      append: "sidebar.content",
+      render: (input) => {
+        const usage = () => {
+          usageRevision();
+
+          return usageFromMessages(
+            usageMessages(ctx.data.session.message.list(input.sessionID)),
+            ctx.data.session.get(input.sessionID)?.tokens,
+          );
+        };
+
+        // Called as a function rather than via JSX so this module stays free of
+        // a static @opentui/solid import; the panel itself owns the JSX.
+        return SidebarPanel({ view: panelView, now: nowMs, usage, colors, quotaVisible });
+      },
+    });
+
+    ctx.keymap.layer(() => ({
+      mode: "global",
+      commands: [
+        {
+          id: "codex_usage",
+          title: "Codex usage",
+          description: "Show current Codex quota",
+          group: "Codex",
+          bind: "ctrl+x u",
+          palette: true,
+          slash: { name: "codex-usage" },
+          run: () => void showQuotaToast(),
         },
-      };
-      debugLog("register callback returned command", {
-        value: command.value,
-        slashName: command.slash.name,
-      });
-      return [command];
-    })(),
-  ]);
-  debugLog("command registered");
+      ],
+    }));
 
-  api.lifecycle.onDispose(() => {
-    debugLog("tui plugin disposed", { slotId });
-    if (pollTimer) clearInterval(pollTimer);
-    if (countdownTimer) clearInterval(countdownTimer);
-    for (const disposeEvent of eventDisposers) disposeEvent();
-    dispose();
-  });
-};
+    // Token totals move with message content updates; anything narrower than
+    // this prefix would miss streamed usage the sidebar is meant to reflect.
+    const stopListening = ctx.data.listen(({ details }) => {
+      if (!details.type.startsWith("session.message")) return;
 
-export default { id: "opencode-codex-usage", tui: CodexQuotaTuiPlugin };
+      setUsageRevision((revision) => revision + 1);
+    });
+
+    let pollTimer: ReturnType<typeof setInterval> | undefined;
+
+    const stopPolling = () => {
+      if (!pollTimer) return;
+      clearInterval(pollTimer);
+      pollTimer = undefined;
+    };
+
+    createEffect(() => {
+      if (!quotaVisible()) {
+        stopPolling();
+
+        return;
+      }
+
+      stopPolling();
+      pollTimer = setInterval(() => void refresh(), pollMs);
+      void refresh();
+    });
+
+    const countdownTimer = setInterval(() => setNowMs(Date.now()), COUNTDOWN_TICK_MS);
+
+    return () => {
+      stopPolling();
+      clearInterval(countdownTimer);
+      stopListening();
+      releaseSlot();
+    };
+  },
+});
+
+export default CodexQuotaTuiPlugin;

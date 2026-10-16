@@ -3,6 +3,8 @@
     "target": "ES2022",
     "module": "ES2022",
     "moduleResolution": "Bundler",
+    "jsx": "react-jsx",
+    "jsxImportSource": "@opentui/solid",
     "outDir": "dist",
     "rootDir": ".",
     "paths": {
@@ -15,5 +17,5 @@
     "esModuleInterop": true,
     "forceConsistentCasingInFileNames": true
   },
-  "include": ["*.ts", "bin/**/*.ts", "lib/**/*.ts"]
+  "include": ["*.ts", "bin/**/*.ts", "lib/**/*.ts", "lib/**/*.tsx"]
 }
